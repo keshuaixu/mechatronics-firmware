@@ -189,3 +189,15 @@ Input: <design>.bit;
 Exports: $proj_output.mcs;
 Reports: $proj_output.prm, $proj_output.cfi;
 End Program promgen
+
+#
+# Flow Info for Promgen. Make .bin file for OpenOCD.
+#
+Program promgen_bin
+Flag: ENABLED;
+Executable: promgen;
+Input: <design>.bit;
+Exports: $proj_output.bin;
+End Program promgen_bin
+
+

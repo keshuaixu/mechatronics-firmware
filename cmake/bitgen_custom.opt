@@ -37,3 +37,18 @@ Program promgen
 -u 0000;                  # Load upward starting at address
 <inputdir><design>.bit;   # Input bit file (must follow -u option)
 END Program promgen
+
+#
+# Options for promgen
+#
+Program promgen_bin
+-intstyle silent;
+-w;                       # Overwrite file
+-c FF;                    # Checksum
+-o $proj_output;          # Output file name
+-s 2048;                  # Prom size (in Kbytes)
+-spi;                     # Disable bit swapping for compatibility with SPI flash devices
+-p bin;
+-u 0000;                  # Load upward starting at address
+<inputdir><design>.bit;   # Input bit file (must follow -u option)
+END Program promgen_bin
