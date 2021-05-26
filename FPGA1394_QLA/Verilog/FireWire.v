@@ -3,7 +3,7 @@
 
 /*******************************************************************************
  *
- * Copyright(C) 2008-2020 ERC CISST, Johns Hopkins University.
+ * Copyright(C) 2008-2021 ERC CISST, Johns Hopkins University.
  *
  * This module implements the FireWire link layer state machine, which defines
  * the operation of the phy-link interface.  The state machine is triggered on
@@ -82,6 +82,8 @@
  *   We noticed that some FireWire cards have issue with broadcast packets (can not 
  *   async read after sending broadcast packets). This leads us to use an asynchronous 
  *   write packet as fake broadcast packet on the PC software for better robustness. 
+ *  2021-03-06 Also, it seems that libraw1394 or the Juju Firewire driver may not allow
+ *   broadcasts (permission denied error).
  *    
  *   Lists:
  *     - Query Packet:  dest_node_id = 0, dest_addr = 0xffffffff000f   (< Rev 7)
@@ -111,7 +113,7 @@
 // The Configuration ROM follows ISO/IEC 13213:
 //   The minimum ROM format requires the following 32-bit value to be
 //   stored at address ffff f000 0400:  | 1 (8) | vendor_id (24) |
-//   For JHU-LCSR, the 24-bit vendor_id is FA610E (see MIN_ROM_ENTRY)
+//   For JHU-LCSR, the 24-bit vendor_id is FA610E (see JHU_LCSR_CID)
 // -----------------------------------------------------------------
 
 
@@ -179,6 +181,7 @@
 `define JHU_LCSR_CID   24'hFA610E
 
 // Minimum Configuration ROM Entry:  | 01 (8) | FA610E (24) |
+// This is not currently used (using General ROM format)
 `define MIN_ROM_ENTRY  {4'h01, `JHU_LCSR_CID}
 
 module PhyLinkInterface(
@@ -227,7 +230,9 @@ module PhyLinkInterface(
     // broadcast related fields
     input wire[15:0] rx_bc_sequence, // broadcast sequence num
     input wire[15:0] rx_bc_fpga,     // indicates whether a boards exists
-    input wire rx_bc_bread,          // rx broadcast read request flag
+    input wire write_trig,           // request to broadcast this board's hub data
+    output wire write_trig_reset,    // reset write_trig
+    output wire fw_idle,             // whether Firewire state machine is idle
 
     // Interface for real-time block write
     output reg       fw_rt_wen,
@@ -238,8 +243,7 @@ module PhyLinkInterface(
     output reg sample_start,         // 1 -> start sampling for block read
     input wire sample_busy,          // Sampling in process
     output wire[4:0] sample_raddr,   // Read address for sampled data
-    input wire[31:0] sample_rdata,   // Sampled data (for block read)
-    output reg writeHub              // 1 -> write to Hub after sampling
+    input wire[31:0] sample_rdata    // Sampled data (for block read)
 
     // debug
 `ifdef USE_CHIPSCOPE
@@ -277,6 +281,9 @@ module PhyLinkInterface(
     reg[9:0] bus_id;              // phy bus id (10 bits)
     initial bus_id = 10'h3ff;     // set default bus_id to 10'h3ff
     wire[15:0] local_id;          // full addr = bus_id + node_id
+
+    // Indicates whether Firewire state machine is idle
+    assign fw_idle = (state == ST_IDLE) ? 1'b1 : 1'b0;
 
     // status-related buffers
     reg[15:0] st_buff;            // temp buffer for status
@@ -329,52 +336,208 @@ module PhyLinkInterface(
     assign addrMainRead  = (reg_raddr[15:12] == `ADDR_MAIN) ? 1'd1 : 1'd0;
     assign addrMainWrite = (reg_waddr[15:12] == `ADDR_MAIN) ? 1'd1 : 1'd0;
 
-    // It is a ROM read when the upper 36 bits are ffff f0000.
+    // It is a ROM read (or write) when the upper 36 bits are ffff f0000.
     // This covers addresses from ffff f000 0000 to ffff f000 0fff, which includes
     // the CSR Architecture, Serial Bus, Configuration ROM and more.
     // Note that it is more convenient to use reg_raddr[11:0] instead of rx_addr_full[11:0].
-    wire rom_read;          // Whether reading from Configuration ROM
-    assign rom_read = (rx_addr_full[47:12] == 36'hfffff0000) ? 1'b1 : 1'b0;
+    wire rom_addr;          // Whether reading (or writing) from CSR Registers or Configuration ROM
+    assign rom_addr = (rx_addr_full[47:12] == 36'hfffff0000) ? 1'b1 : 1'b0;
+
+    // CSR Registers:
+    //   CSR[0] = 000: STATE_CLEAR
+    //   CSR[1] = 004: STATE_SET
+    //   CSR[2] = 008: NODE_IDS
+    //   CSR[3] = 00C: RESET_START (not needed, read as 0)
+    //   CSR[6] = 018: SPLIT_TIMEOUT_HI
+    //   CSR[7] = 01C: SPLIT_TIMEOUT_LO
+   reg[31:0] csr_state = { 16'h0000, 8'h00, 8'b00000000 };
+   reg[2:0]  split_timeout_sec = 3'd0;
+   reg[12:0] split_timeout_125usec = 13'd800;
 
     // Configuration ROM data
     reg[31:0] rom_data;
 
-    wire[3:0] fpga_ver;       // FPGA version
 `ifdef HAS_ETHERNET
-    assign fpga_ver = 4'hE;   // Ethernet/Firwire (Rev 2.x)
+    localparam[3:0]  fpga_ver = 4'hE;   // Ethernet/Firewire (Rev 2.x)
+    localparam[23:0] fpga_rev = 24'h2;
+    localparam[7:0]  fpga_num = "2";
 `else
-    assign fpga_ver = 4'hF;   // Firewire (Rev 1.x)
+    localparam[3:0]  fpga_ver = 4'hF;   // Firewire (Rev 1.x)
+    localparam[23:0] fpga_rev = 24'h1;
+    localparam[7:0]  fpga_num = "1";
 `endif
 
-    // Configuration ROM:
-    //   0400:  ROM Format (Minimal or General)
+    // CRCs for ROM entries.
+    // This is computed using CRC16-CCIT (also known as CRC-ITU).
+    // See ComputeConfigCRC in mechatronics-software repository.
+    // The bus_info CRC depends on the board version (Ethernet or Firewire),
+    // the board number (0-15), and the firmware version (7).
+    // The root_dir and model_desc CRC depends on the board version.
+    // The vendor_desc CRC is constant ("JHU LCSR").
+    // It seems that the Linux driver does not care if the CRC is
+    // correct, but we provide the correct CRC just in case.
+    reg[15:0] info_crc;
+    localparam[15:0] vendor_crc = 16'h56c4;
+
+`ifdef HAS_ETHERNET
+    // Version: Ethernet
+    always @(*)
+    begin
+        case (board_id)
+            4'h0: info_crc = 16'h8496;
+            4'h1: info_crc = 16'h80cc;
+            4'h2: info_crc = 16'h8c22;
+            4'h3: info_crc = 16'h8878;
+            4'h4: info_crc = 16'h95fe;
+            4'h5: info_crc = 16'h91a4;
+            4'h6: info_crc = 16'h9d4a;
+            4'h7: info_crc = 16'h9910;
+            4'h8: info_crc = 16'ha646;
+            4'h9: info_crc = 16'ha21c;
+            4'ha: info_crc = 16'haef2;
+            4'hb: info_crc = 16'haaa8;
+            4'hc: info_crc = 16'hb72e;
+            4'hd: info_crc = 16'hb374;
+            4'he: info_crc = 16'hbf9a;
+            4'hf: info_crc = 16'hbbc0;
+        endcase
+    end
+
+    localparam[15:0] root_crc  = 16'h9395;
+    localparam[15:0] model_crc = 16'h87b6;
+`else
+    // Version: Firewire
+    always @(*)
+    begin
+        case (board_id)
+            4'h0: info_crc = 16'h2ec7;
+            4'h1: info_crc = 16'h2a9d;
+            4'h2: info_crc = 16'h2673;
+            4'h3: info_crc = 16'h2229;
+            4'h4: info_crc = 16'h3faf;
+            4'h5: info_crc = 16'h3bf5;
+            4'h6: info_crc = 16'h371b;
+            4'h7: info_crc = 16'h3341;
+            4'h8: info_crc = 16'h0c17;
+            4'h9: info_crc = 16'h084d;
+            4'ha: info_crc = 16'h04a3;
+            4'hb: info_crc = 16'h00f9;
+            4'hc: info_crc = 16'h1d7f;
+            4'hd: info_crc = 16'h1925;
+            4'he: info_crc = 16'h15cb;
+            4'hf: info_crc = 16'h1191;
+        endcase
+    end
+
+    localparam[15:0] root_crc  = 16'h7d47;
+    localparam[15:0] model_crc = 16'h4fc3;
+`endif
+
+    // Configuration ROM (General format):
+    //   ROM[0]  = 400:  info_length (8) | crc_length (8) | crc_value (16)
     // Bus_Info_Block:
-    //   0404:  "1394"
-    //   0408:  irmc, cmc, isc, bmc, pmc, reserved, cyc_clk_acc, max_rec, reserved, gen, rs, link_spd
-    //   040c:  node_vendor_id (24) | chip_id_hi (4)
-    //   0410:  chip_id_lo (32)
+    //   ROM[1]  = 404:  "1394" (bus name)
+    //   ROM[2]  = 408:  irmc, cmc, isc, bmc, pmc, reserved, cyc_clk_acc, max_rec, reserved, gen, rs, link_spd
+    //   ROM[3]  = 40c:  node_vendor_id (24) | chip_id_hi (4)
+    //   ROM[4]  = 410:  chip_id_lo (32)
+    // Root_Directory_Block:
+    //   ROM[5]  = 414:  block_length (16) | block_crc (16)
+    // Root_Directory:
+    //   ROM[6]  = 418:  0 (2) | 0C (6) | node_capabilities (24)
+    //   ROM[7]  = 41C:  0 (2) | 03 (6) | module_vendor_id (24)
+    //   ROM[8]  = 420:  2 (2) | 01 (6) | offset to vendor descriptor leaf (24)
+    //   ROM[9]  = 424:  0 (2) | 17 (6) | model (24)
+    //   ROM[10] = 428:  2 (2) | 01 (6) | offset to model descriptor leaf (24)
+    // Vendor_Descriptor_Block:
+    //   ROM[11] = 42C:  block_length (16) | block_crc (16)
+    //   ROM[12] = 430:  vendor descriptor
+    //   ROM[13] = 434:  vendor descriptor
+    //   ROM[14] = 438:  vendor descriptor
+    //   ROM[14] = 43C:  vendor descriptor
+    // Model_Descriptor_Block:
+    //   ROM[15] = 440:  block_length (16) | block_crc (16)
+    //   ROM[16] = 444:  model descriptor
+    //   ROM[17] = 448:  model descriptor
+    //   ROM[18] = 44C:  model descriptor
+    //   ROM[19] = 450:  model descriptor
+    //   ROM[20] = 454:  model descriptor
     //
-    // We specify the Minimal ROM format (MIN_ROM_ENTRY), but it seems that drivers still expect
-    // valid information in at least some of the Bus_Info_Block, especially to create the GUID.
+    // All lengths are in quadlets. See above for CRC computation.
+    //
+    // We can instead specify the Minimal ROM format (MIN_ROM_ENTRY) for ROM[0], but it seems that drivers
+    //  still expect valid information in at least some of the Bus_Info_Block, especially to create the GUID.
+    //
+    // Node capabilities (in Root_Directory):
+    //   24'h0083c0 -> split_timeout, 64-bit addressing, fixed addressing, lost bit, disable request
+    //
+    // Descriptor strings must have first two quadlets equal to 0 (see textual_leaf_to_string in
+    // core-device.c, Linux driver source code).
 
     always @(*)
     begin
-        if (reg_raddr[11:5] == {4'h4, 3'b000}) begin
-            if (reg_raddr[4:0] == 5'b00000)      // 0400
-                rom_data = `MIN_ROM_ENTRY;
-            else if (reg_raddr[4:0] == 5'b00100) // 0404
-                rom_data = "1394";
-            else if (reg_raddr[4:0] == 5'b01000) // 0408
-                rom_data = 32'h00ffa000;   // should be default values
-            else if (reg_raddr[4:0] == 5'b01100) // 040C
-                rom_data = {`JHU_LCSR_CID, board_id, fpga_ver};
-            else if (reg_raddr[4:0] == 5'b10000) // 0410
-                rom_data = `FW_VERSION;
+        if (reg_raddr[11:5] == {4'h0, 3'b000}) begin
+            // CSR Registers
+            if (reg_raddr[4:0] == 5'b00x00)          // 000/004
+               rom_data = csr_state;
+            else if (reg_raddr[4:0] == 5'b01000)     // 008
+               rom_data = { bus_id, node_id, 16'd0 };
+            else if (reg_raddr[4:0] == 5'b11000)     // 018
+               rom_data = { 29'd0, split_timeout_sec };
+            else if (reg_raddr[4:0] == 5'b11100)     // 01C
+               rom_data = { split_timeout_125usec, 19'd0 };
             else
-                rom_data = 32'd0;
+               rom_data = 32'd0;
+        end
+        else if (reg_raddr[11:8] == 4'h4) begin
+            // Configuration ROM
+            case (reg_raddr[7:0])
+              8'h00: rom_data = { 8'h04, 8'h04, info_crc }; // 400: bus_info_len, CRC
+              8'h04: rom_data = "1394";                     // 404
+              8'h08: rom_data = 32'h00ffa000;               // 408: should be default values
+              8'h0c: rom_data = {`JHU_LCSR_CID, board_id, fpga_ver};  // 40C
+              8'h10: rom_data = `FW_VERSION;                // 410
+              8'h14: rom_data = { 16'h05, root_crc };       // 414: root_dir_len, CRC
+              8'h18: rom_data = { 8'h0c, 24'h0083c0 };      // 418: node capabilities
+              8'h1c: rom_data = { 8'h03, `JHU_LCSR_CID };   // 41c: vendor id
+              8'h20: rom_data = { 8'h81, 24'd3 };           // 420: offset to vendor descriptor
+              8'h24: rom_data = { 8'h17, fpga_rev };        // 424: model
+              8'h28: rom_data = { 8'h81, 24'd6 };           // 428: offset to model descriptor
+              8'h2c: rom_data = { 16'd4, vendor_crc };      // 42C: vendor descriptor block
+              8'h30: rom_data = 32'd0;                      // 430:   "JHU LCSR"
+              8'h34: rom_data = 32'd0;                      // 434
+              8'h38: rom_data = "JHU ";                     // 438
+              8'h3c: rom_data = "LCSR";                     // 43C
+              8'h40: rom_data = { 16'd5, model_crc };       // 440: model descriptor block
+              8'h44: rom_data = 32'd0;                      // 444:   "FPGAn/QLA"
+              8'h48: rom_data = 32'd0;                      // 448:   (n = "1" or "2")
+              8'h4c: rom_data = "FPGA";                     // 44C
+              8'h50: rom_data = { fpga_num, "/QL" };        // 450
+              8'h54: rom_data = { "A", 24'd0 };             // 454
+              default: rom_data = 32'd0;
+            endcase
         end
         else
             rom_data = 32'd0;
+    end
+
+    // Following block handles writes to CSR Registers.
+    // Currently, most of these registers (with the exception of bus_id) are
+    // ignored by the firmware. A more complete implementation would actually
+    // use the values in these registers.
+    always @(posedge sysclk)
+    begin
+        if (reg_wen&rom_addr) begin
+            if (reg_waddr[11:0] == 12'h000)
+                csr_state[31:2] <= csr_state[31:2]&(~reg_wdata[31:2]);
+            else if (reg_waddr[11:0] == 12'h004)
+                csr_state[31:2] <= csr_state[31:2]|reg_wdata[31:2];
+            else if (reg_waddr[11:0] == 12'h008)
+                bus_id <= reg_wdata[31:22];
+            else if (reg_waddr[11:0] == 12'h018)
+                split_timeout_sec <= reg_wdata[2:0];
+            else if (reg_waddr[11:0] == 12'h01C)
+                split_timeout_125usec <= reg_wdata[31:19];
+        end
     end
 
     // state machine states
@@ -447,6 +610,8 @@ crc32 mycrc(crc_data, crc_in, crc_2b, crc_4b, crc_8b);
 // for phy requests, this bit distinguishes between register read and write
 assign phy_rw = buffer[12];
 
+assign write_trig_reset = ((lreq_type == `LREQ_TX_ISO) && (tx_type == `TX_TYPE_BBC)) ? 1'b1 : 1'b0;
+
 `ifdef HAS_ETHERNET
 // packet module (used to store FireWire packet that will be forwarded to Ethernet).
 // This is 512 quadlets (512 x 32), which is the maximum possible Firewire packet size at 400 Mbits/sec
@@ -464,65 +629,6 @@ hub_mem_gen pkt_mem(.clka(sysclk),
                     );
 `endif
    
-// -------------------------------------------------------
-// Broadcast Time Counter 
-//   - Trigger:
-//      - Special broadcast qwrite serves as bc read request
-//   - Time offset
-//      - 5 us is enough for 1 board to send data
-//      - wait for lower numbered boards to send data first
-//      - add 3 us for ACK
-// -------------------------------------------------------
-reg[31:0] write_counter;
-wire[14:0] write_trig_count;    // 6 bits node_id + 8 bits (256 counts)
-reg write_trig;                 // triggers broadcast board status
-wire board_selected;            // flag: whether board is selected on PC side
-wire [15:0] rx_bc_fpga_masked;  // indicate whether a board exist from board 0 to board_id
-
-assign rx_bc_fpga_masked = ((16'b1 << board_id) - 16'b1) & rx_bc_fpga;
-assign board_selected = rx_bc_fpga[board_id];
-
-reg [15:0] d;
-reg [5:0] write_trig_seq;   // counts how many boards before board_id
-always @ (posedge sysclk) begin
-   d <= rx_bc_fpga_masked;
-   write_trig_seq <= (((d[ 0] + d[ 1] + d[ 2] + d[ 3]) + (d[ 4] + d[ 5] + d[ 6] + d[ 7]))
-            +  ((d[ 8] + d[ 9] + d[10] + d[11]) + (d[12] + d[13] + d[14] + d[15])));
-end
-
-assign write_trig_count = {write_trig_seq, 8'd150};
-
-always @(posedge(sysclk))
-begin
-    if (rx_bc_bread) begin               // if broadcast read request received
-        write_counter <= 32'd0;          //    reset counter
-        write_trig <= 1'b0;
-    end
-    else begin
-        // First, wait (256*write_trig_seq+150) cycles, where each cycle is 20.345 ns.
-        // write_trig_seq is equal to the number of boards in use that have a lower
-        // number than the current board. 150 cycles is added for the ACK packet.
-        // For example, if there is 1 board with a lower number, then the wait
-        // will be for 256*1+150 = 406 cycles, or 8.26 microseconds.
-        // In general, for N lower-numbered boards, wait 256*N+150 = 5.21*N+3.05 microseconds.
-        // Next, if this board is selected, set write_trig, which will cause the
-        // Firewire state machine to set lreq_type == `LREQ_TX_ISO.
-        // Note that write_counter is not updated after write_trig is set, so it remains
-        // at (write_trig_count+1) until the next broadcast read request.
-        if (write_counter < write_trig_count) begin
-            write_counter <= write_counter + 1'b1;
-            write_trig <= 1'b0;
-        end
-        else if (write_counter == write_trig_count) begin
-            write_counter <= write_counter + 1'b1;
-            write_trig <= board_selected;
-        end
-        else if (lreq_type == `LREQ_TX_ISO) begin
-            write_trig <= 1'b0;
-        end
-    end
-end
-
 //
 // state machine clocked by sysclk; transitions depend on ctl and data
 //
@@ -536,10 +642,9 @@ begin
     end
 `endif
 
-    // Clear sample_start (and writeHub) when sample_busy asserted
+    // Clear sample_start when sample_busy asserted
     if (sample_start && sample_busy) begin
         sample_start <= 1'd0;
-        writeHub <= 1'd0;
     end
 
     // phy-link state machine
@@ -843,13 +948,13 @@ begin
                             // broadcast read request    (trick: NOT standard !!!)
                             // rx_dest == 0 is an asynchronous quadlet write; it is sent to node 0, but processed
                             //              by all nodes.
-                            // rx_dest == 3f is a broadcast command (no ack); was used for testing.
+                            // rx_dest == 3f is a broadcast command (no ack)
                             if ((rx_dest[5:0] == 6'd0 || rx_dest[5:0] == 6'h3f) && rx_tcode == `TC_QWRITE && 
                                 (buffer[15:12] == `ADDR_HUB) && (buffer[11:0] == 12'h800)) begin
                                 rx_active <= 1;
-                                bus_id <= rx_src[15:6];    // latch bus_id
+                                // bus_id <= rx_src[15:6];    // latch bus_id
                             end
-                            // broadcast write commands 
+                            // broadcast write commands ("fake broadcast")
                             else if (rx_dest[5:0] == 6'd0 && rx_tcode == `TC_BWRITE && 
                                 rx_addr_full[47:32] == 16'hffff && buffer[31:0] == 32'hffff0000) begin
                                 rx_active <= 1;
@@ -979,13 +1084,11 @@ begin
                     // Start sampling feedback data if a block read from ADDR_MAIN or
                     // a broadcast read request (quadlet write to ADDR_HUB). Note that sampler
                     // will enter its busy state (after the next cycle) and take control of reg_raddr
-                    // for a few cycles. If writeHub is set, the sampler will also directly write
-                    // this board's feedback to the Hub memory.
+                    // for a few cycles.
                     if (rx_active &&
                         ((addrMainRead && (rx_tcode==`TC_BREAD)) ||
                          ((reg_waddr[15:0] == {`ADDR_HUB, 12'h800}) && (rx_tcode==`TC_QWRITE)))) begin
                        sample_start <= 1;
-                       writeHub <= (rx_tcode == `TC_QWRITE) ? 1'b1 : 1'b0;
                     end
                 end
 
@@ -1140,7 +1243,7 @@ begin
                 case (count)
                      24: buffer <= { rx_dest, `RC_DONE, 12'd0 };
                      56: buffer <= 0;
-                     88: buffer <= rom_read ? rom_data : reg_rdata;
+                     88: buffer <= rom_addr ? rom_data : reg_rdata;
                     128: begin
                         data <= ~crc_8msb;
                         buffer <= { ~crc_in[23:0], 8'd0 };
@@ -1180,10 +1283,10 @@ begin
                 // restart crc and goto ST_TX_DATA
                 152: begin                                    // quadlet 6 
                     // ----- BRESP Continue -------
-                    buffer <= rom_read ? rom_data :
+                    buffer <= rom_addr ? rom_data :
                               addrMainRead ? sample_rdata : reg_rdata;
-                    // Note that for rom_read, we increment by 4, otherwise by 1.
-                    reg_raddr[11:0] <= reg_raddr[11:0] + {9'd0,rom_read,1'b0,~rom_read};
+                    // Note that for rom_addr, we increment by 4, otherwise by 1.
+                    reg_raddr[11:0] <= reg_raddr[11:0] + {9'd0,rom_addr,1'b0,~rom_addr};
                     state <= ST_TX_DATA;
                     crc_ini <= 0;
                 end
@@ -1213,7 +1316,7 @@ begin
                 //  - 4'h01 = `ADDR_HUB
                 //  - bid is 4 bits board id
                 24: buffer <= { local_id, 16'hffff };  // src_id, dest_offset
-                56: buffer <= { 16'hff00, `ADDR_HUB, 3'd0, board_id[3:0], 5'd0 }; 
+                56: buffer <= { 16'hff00, `ADDR_HUB, 3'd0, board_id, 5'd0 };
 
                 //-------- Start broadcast back with sequence -------------
                 // datalen = 4 x (1 + 4 + 4 + 4 + 4 + 4) = 84 bytes (Rev 1-6)
@@ -1224,6 +1327,10 @@ begin
                 
                 // latch header crc, reset crc in preparation for data crc
                 128: begin
+                    // for hub register (HubReg)
+                    reg_waddr[15:0] <= { `ADDR_HUB, 3'd0, board_id, 5'd0 };
+                    reg_wen <= 1'b1;
+
                     // crc
                     data <= ~crc_8msb;
                     buffer <= { ~crc_in[23:0], 8'd0 };
@@ -1232,6 +1339,7 @@ begin
 
                 // latch bc_sequence and bc_fpga, send back to PC,  restart crc
                 152: begin
+                    reg_wdata <= { rx_bc_sequence, rx_bc_fpga };  // for HubReg
                     buffer <= { rx_bc_sequence, rx_bc_fpga };
                     crc_ini <= 0;           // clear crc start bit
                     reg_raddr <= {`ADDR_MAIN, 12'd0 };  // Will actually read from SampleData
@@ -1261,13 +1369,19 @@ begin
                 
                 // latch data and update addresses on quadlet boundaries
                 if (count[4:0] == 5'd24) begin
+
+                    // cache to hubreg, only saves to hub when block broadcast packets
+                    // (reg_wen is set in ST_TX_HEAD_BC)
+                    reg_waddr[4:0] <= reg_waddr[4:0] + 5'd1;
+                    reg_wdata <= sample_rdata;
+
                     // send to FireWire bus
-                    buffer <= rom_read ? rom_data :
+                    buffer <= rom_addr ? rom_data :
                               addrMainRead ? sample_rdata : reg_rdata;
                     // 12-bit address increment, even though Firewire limited to 512 quadlets (9 bits)
                     // because this way we can support non-zero starting addresses.
-                    // Note that for rom_read, we increment by 4, otherwise by 1.
-                    reg_raddr[11:0] <= reg_raddr[11:0] + {9'd0,rom_read,1'b0,~rom_read};
+                    // Note that for rom_addr, we increment by 4, otherwise by 1.
+                    reg_raddr[11:0] <= reg_raddr[11:0] + {9'd0,rom_addr,1'b0,~rom_addr};
                 end
 
                 if (count == (numbits-16'd32)) begin

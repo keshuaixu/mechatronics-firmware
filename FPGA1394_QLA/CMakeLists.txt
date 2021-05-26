@@ -49,7 +49,7 @@ set (VERILOG_SOURCE_COMMON "${VERILOG_SOURCE_DIR}/ClkDiv.v"
                            "${VERILOG_SOURCE_DIR}/SampleData.v"
                            "${VERILOG_SOURCE_DIR}/DataBuffer.v"
                            "${IPCORE_BINARY_DIR}/Dual_port_RAM_32X1024.v"
-			   "${VERILOG_SOURCE_DIR}/Reboot.v")
+                           "${VERILOG_SOURCE_DIR}/Reboot.v")
 
 # Verilog source files for Rev 1 firmware
 set (VERILOG_SOURCE_REV1 "${VERILOG_SOURCE_DIR}/FPGA1394-QLA.v"
@@ -86,7 +86,7 @@ ise_compile_fpga(PROJ_NAME      "FPGA1394EthQLA"
 # add_custom_target(timing
 #                   DEPENDS FPGA1394QLA-timing FPGA1394EthQLA-timing)
 
-# Copy MCS files to Generated folder in source tree (if different)
+# Copy MCS and BIT files to Generated folder in source tree (if different)
 add_custom_target(generated)
 
 add_custom_command(TARGET generated POST_BUILD
@@ -96,6 +96,14 @@ add_custom_command(TARGET generated POST_BUILD
                            ${CMAKE_CURRENT_SOURCE_DIR}/Generated/FPGA1394-QLA.mcs
                    COMMAND ${CMAKE_COMMAND}
                    ARGS -E copy_if_different
+                           ${CMAKE_CURRENT_BINARY_DIR}/FPGA1394QLA.bit
+                           ${CMAKE_CURRENT_SOURCE_DIR}/Generated/FPGA1394-QLA.bit
+                   COMMAND ${CMAKE_COMMAND}
+                   ARGS -E copy_if_different
                            ${CMAKE_CURRENT_BINARY_DIR}/FPGA1394Eth-QLA.mcs
                            ${CMAKE_CURRENT_SOURCE_DIR}/Generated/FPGA1394Eth-QLA.mcs
-                   COMMENT "Copying MCS files to source \"Generated\" directory (if different)")
+                   COMMAND ${CMAKE_COMMAND}
+                   ARGS -E copy_if_different
+                           ${CMAKE_CURRENT_BINARY_DIR}/FPGA1394EthQLA.bit
+                           ${CMAKE_CURRENT_SOURCE_DIR}/Generated/FPGA1394Eth-QLA.bit
+                   COMMENT "Copying MCS and BIT files to source \"Generated\" directory (if different)")

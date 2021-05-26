@@ -3,7 +3,7 @@
 
 /*******************************************************************************    
  *
- * Copyright(C) 2011-2020 ERC CISST, Johns Hopkins University.
+ * Copyright(C) 2011-2021 ERC CISST, Johns Hopkins University.
  *
  * This is the top level module for the FPGA1394-QLA motor controller interface.
  *
@@ -95,7 +95,6 @@ BUFG clksysclk(.I(clk1394), .O(sysclk));
 
 // Wires for sampling block read data
 wire sample_start;        // Start sampling read data
-wire writeHub;            // 1 -> write to hub after sampling
 wire sample_busy;         // 1 -> data sampler has control of bus
 wire[3:0] sample_chan;    // Channel for sampling
 wire[4:0] sample_raddr;   // Address in sample_data buffer
@@ -168,29 +167,25 @@ assign reset_phy = 1'b1;
 
 wire[15:0] bc_sequence;
 wire[15:0] bc_board_mask;
-wire       bc_request;
-
-wire hub_wen;             // 1 -> sampler writing to hub
-wire[4:0] hub_waddr;      // write address from sampler
-wire[31:0] hub_wdata;     // write data from sampler
-
-wire reg_wen_hub;
-assign reg_wen_hub = reg_wen|hub_wen;
-wire[15:0] reg_waddr_hub;
-assign reg_waddr_hub = hub_wen ? {`ADDR_HUB, 3'd0, board_id, hub_waddr} : reg_waddr;
-wire[31:0] reg_wdata_hub;
-assign reg_wdata_hub = hub_wen ? hub_wdata : reg_wdata;
+//wire       bc_request;
+wire       hub_write_trig;
+wire       hub_write_trig_reset;
+wire       fw_idle;
 
 HubReg hub(
     .sysclk(sysclk),
-    .reg_wen(reg_wen_hub),
+    .reg_wen(reg_wen),
     .reg_raddr(reg_raddr),
-    .reg_waddr(reg_waddr_hub),
+    .reg_waddr(reg_waddr),
     .reg_rdata(reg_rdata_hub),
-    .reg_wdata(reg_wdata_hub),
+    .reg_wdata(reg_wdata),
     .sequence(bc_sequence),
     .board_mask(bc_board_mask),
-    .hub_reg_wen(bc_request)
+    //.hub_reg_wen(bc_request),
+    .board_id(board_id),
+    .write_trig(hub_write_trig),
+    .write_trig_reset(hub_write_trig_reset),
+    .fw_idle(fw_idle)
 );
 
 
@@ -220,7 +215,9 @@ PhyLinkInterface phy(
 
     .rx_bc_sequence(bc_sequence),  // in: broadcast sequence num
     .rx_bc_fpga(bc_board_mask),    // in: mask of boards involved in broadcast read
-    .rx_bc_bread(bc_request),      // in: 1 -> received broadcast read request
+    .write_trig(hub_write_trig),   // in: 1 -> broadcast write this board's hub data
+    .write_trig_reset(hub_write_trig_reset),
+    .fw_idle(fw_idle),
 
     // Interface for real-time block write
     .fw_rt_wen(rt_wen),
@@ -231,8 +228,7 @@ PhyLinkInterface phy(
     .sample_start(fw_sample_start),   // 1 -> start sampling for block read
     .sample_busy(sample_busy),        // Sampling in process
     .sample_raddr(sample_raddr),      // Read address for sampled data
-    .sample_rdata(sample_rdata),      // Sampled data (for block read)
-    .writeHub(writeHub)               // 1 -> write to hub after sampling
+    .sample_rdata(sample_rdata)       // Sampled data (for block read)
 );
 
 
@@ -533,6 +529,7 @@ assign  Eth_Result = 32'b0;
 wire[31:0] reg_status;    // Status register
 wire[31:0] reg_digio;     // Digital I/O register
 wire[15:0] tempsense;     // Temperature sensor
+wire[15:0] reg_databuf;   // Data collection status
 
 wire reboot;              // Reboot the FPGA
 
@@ -591,7 +588,7 @@ SampleData sampler(
     .isBusy(sample_busy),
     .reg_status(reg_status),
     .reg_digio(reg_digio),
-    .reg_temp({16'd0, tempsense}),
+    .reg_temp({reg_databuf, tempsense}),
     .chan(sample_chan),
     .adc_in(reg_adc_data),
     .enc_pos(reg_quad_data),
@@ -603,11 +600,7 @@ SampleData sampler(
     .blk_data(sample_rdata),
     .timestamp(timestamp),
     .bc_sequence(bc_sequence),
-    .bc_board_mask(bc_board_mask),
-    .writeHub(writeHub),
-    .hub_waddr(hub_waddr),
-    .hub_wdata(hub_wdata),
-    .hub_wen(hub_wen)
+    .bc_board_mask(bc_board_mask)
 );
 
 // --------------------------------------------------------------------------
@@ -688,7 +681,10 @@ DataBuffer data_buffer(
     .reg_wdata(reg_wdata),          // write data
     .reg_wen(reg_wen),              // write enable
     .reg_raddr(reg_raddr),          // read address
-    .reg_rdata(reg_rdata_databuf)   // read data
+    .reg_rdata(reg_rdata_databuf),  // read data
+    // status and timestamp
+    .databuf_status(reg_databuf),   // status for SampleData
+    .ts(timestamp)                  // timestamp from SampleData
 );
 
 //------------------------------------------------------------------------------
