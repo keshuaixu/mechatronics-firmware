@@ -35,6 +35,7 @@ module tb_espm_to_fpga_direct;
     wire [1:0] rx_cfsm_unused;
     wire [15:0] rx_page_unused;
     wire [9:0]  rx_length_unused;
+    wire        frame_done_unused;
     /* verilator lint_on UNUSED */
 
     ESPMTX tx (
@@ -45,12 +46,14 @@ module tb_espm_to_fpga_direct;
         .crc_override_enable(1'b0),
         .crc_override_value (16'h0000),
         .hold_frame         (1'b0),
+        .prime_quadlet      (32'd0),
+        .prime_valid        (1'b0),
         .cfsm               (tx_cfsm_unused),
         .tdata_sel          (tsel),
         .pkt_start          (pkt_start),
         .load_tdata         (load_tdata),
         .tdat               (serial_out),
-        .frame_done         ()
+        .frame_done         (frame_done_unused)
     );
 
     wire [31:0] rdata;

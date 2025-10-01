@@ -224,6 +224,10 @@ module ESSJBridge #(
     reg        frame_ready;
     reg        hold_frame;
     reg        override_pending;
+    reg [31:0] prime_quadlet_reg;
+    reg        prime_valid_reg;
+    reg [31:0] tx_prime_quadlet;
+    reg        tx_prime_valid;
 
     function [9:0] sanitize_length;
         input [9:0] raw_length;
@@ -265,9 +269,13 @@ module ESSJBridge #(
     wire [9:0] active_length_for_write = (frame_ready || !hold_frame) ? current_length : sanitized_length_next;
 
     wire [9:0] rx_index_ext = rx_index;
-    wire in_adc_window = (rx_index_ext >= ADC_BASE_QUADLET[9:0]) &&
-                         (rx_index_ext < (ADC_BASE_QUADLET + ADC_WORD_COUNT)[9:0]);
-    wire [9:0] adc_offset = rx_index_ext - ADC_BASE_QUADLET[9:0];
+    wire [9:0] adc_base_quadlet_10b = ADC_BASE_QUADLET[9:0];
+    wire [9:0] adc_window_end_10b   = ADC_BASE_QUADLET[9:0] + ADC_WORD_COUNT[9:0];
+    wire in_adc_window = (rx_index_ext >= adc_base_quadlet_10b) &&
+                         (rx_index_ext < adc_window_end_10b);
+    /* verilator lint_off UNUSEDSIGNAL */
+    wire [9:0] adc_offset = rx_index_ext - adc_base_quadlet_10b;
+    /* verilator lint_on UNUSEDSIGNAL */
     wire [2:0] adc_lookup_index = adc_offset[2:0];
 
     reg [31:0] fifo_write_data;
@@ -280,12 +288,21 @@ module ESSJBridge #(
     end
 
     wire fifo_write_candidate = rx_load && (rx_index_ext < PAYLOAD_WORDS_10B);
+    wire first_word_write = fifo_write_candidate && (rx_index_ext == 10'd0);
+    wire [6:0] payload_words_7b = PAYLOAD_WORDS[6:0];
     wire fifo_write_enable = fifo_write_candidate &&
                              (rx_index_ext < active_length_for_write) &&
-                             (fifo_count < PAYLOAD_WORDS);
+                             (fifo_count < payload_words_7b);
 
     wire fifo_empty = fifo_count == 7'd0;
+    wire frame_single_word = current_length <= 10'd1;
+    reg  launch_pending;
+    reg [5:0] frame_base_ptr;
     wire fifo_read_enable = (tx_cfsm == TX_STATE_DATA) && load_tdata && !fifo_empty;
+    wire fifo_read_enable_effective = fifo_read_enable && !launch_pending;
+    wire have_prime_entry = !fifo_empty || fifo_write_enable;
+    wire have_two_entries = (fifo_count > 7'd1) || ((fifo_count == 7'd1) && fifo_write_enable);
+    wire launch_ready = frame_single_word ? have_prime_entry : have_two_entries;
 
     always @(posedge clock or posedge reset) begin
         if (reset) begin
@@ -298,11 +315,25 @@ module ESSJBridge #(
             tx_page_reg      <= 16'd0;
             frame_ready      <= 1'b0;
             hold_frame       <= 1'b1;
+            prime_quadlet_reg<= 32'd0;
+            prime_valid_reg  <= 1'b0;
+            tx_prime_quadlet <= 32'd0;
+            tx_prime_valid   <= 1'b0;
+            launch_pending   <= 1'b0;
+            frame_base_ptr   <= 6'd0;
         end else begin
             if (frame_start_detect) begin
                 current_length    <= sanitized_length_next;
                 current_page      <= rx_page;
                 frame_ready       <= 1'b1;
+                prime_valid_reg   <= 1'b0;
+                launch_pending    <= 1'b0;
+                frame_base_ptr    <= fifo_wr_ptr;
+            end
+
+            if (first_word_write && (rx_index_ext < active_length_for_write)) begin
+                prime_quadlet_reg <= fifo_write_data;
+                prime_valid_reg   <= 1'b1;
             end
 
             if (fifo_write_enable) begin
@@ -310,23 +341,37 @@ module ESSJBridge #(
                 fifo_wr_ptr <= fifo_wr_ptr + 6'd1;
             end
 
-            if (fifo_read_enable) begin
+            if (fifo_read_enable_effective) begin
                 fifo_rd_ptr <= fifo_rd_ptr + 6'd1;
             end
 
-            case ({fifo_write_enable, fifo_read_enable})
+            case ({fifo_write_enable, fifo_read_enable_effective})
                 2'b10: fifo_count <= fifo_count + 7'd1;
                 2'b01: fifo_count <= fifo_count - 7'd1;
                 default: fifo_count <= fifo_count;
             endcase
 
-            if (hold_frame && frame_ready && !fifo_empty) begin
+            if (hold_frame && frame_ready &&
+                prime_valid_reg && launch_ready) begin
+                launch_pending <= 1'b1;
+            end
+
+            if (launch_pending) begin
                 tx_length_reg <= current_length;
                 tx_page_reg   <= current_page;
+                tx_prime_quadlet <= prime_quadlet_reg;
+                tx_prime_valid   <= prime_valid_reg;
                 hold_frame    <= 1'b0;
                 frame_ready   <= 1'b0;
+                prime_valid_reg <= 1'b0;
+                fifo_rd_ptr <= frame_base_ptr + 6'd1;
+                if (fifo_count != 7'd0) begin
+                    fifo_count  <= fifo_count - 7'd1;
+                end
+                launch_pending <= 1'b0;
             end else if (frame_done) begin
                 hold_frame <= 1'b1;
+                tx_prime_valid <= 1'b0;
             end
         end
     end
@@ -359,6 +404,8 @@ module ESSJBridge #(
         .crc_override_enable(override_pending),
         .crc_override_value (16'hDEAD),
         .hold_frame         (hold_frame),
+        .prime_quadlet      (tx_prime_quadlet),
+        .prime_valid        (tx_prime_valid),
         .frame_done         (frame_done),
         .cfsm               (tx_cfsm),
         .tdata_sel          (tdata_sel),
@@ -383,6 +430,8 @@ module ESPMTX (
     input  wire        crc_override_enable,
     input  wire [15:0] crc_override_value,
     input  wire        hold_frame,
+    input  wire [31:0] prime_quadlet,
+    input  wire        prime_valid,
 
     output reg   [1:0] cfsm,       // current state
     output wire  [9:0] tdata_sel,  // 6 bit counter that selects tdata multiplexor
@@ -408,6 +457,7 @@ module ESPMTX (
     reg [31:0] payload_buffer;
     reg        crc_override_active;
     reg [15:0] crc_override_latched;
+    reg        prime_active;
     wire       hold_active;
 
     assign hold_active = hold_frame && (cfsm == FRAME) && (bit_ctr == 15'd0);
@@ -425,6 +475,7 @@ module ESPMTX (
         crc_override_active = 1'b0;
         crc_override_latched= 16'd0;
         frame_done          = 1'b0;
+        prime_active        = 1'b0;
     end
 
     //----------------------------------------------------------------------------------------------
@@ -433,7 +484,7 @@ module ESPMTX (
         case (cfsm)
             FRAME: current_quadlet = `ESPMCOMM_MAGIC;
             T_HEADER: current_quadlet = {page_latched, 6'b0, length_latched};
-            T_DATA: current_quadlet = payload_buffer;
+            T_DATA: current_quadlet = prime_active ? prime_quadlet : payload_buffer;
             T_CRC: current_quadlet = {16'b0, crc_override_active ? crc_override_latched : crc_data};
             default: current_quadlet = 32'hcccccccc;
         endcase
@@ -446,6 +497,7 @@ module ESPMTX (
             load_tdata <= 1'b0;
             tdat       <= 1'b0;
             frame_done <= 1'b0;
+            prime_active <= 1'b0;
         end else begin
             bit_ctr <= bit_ctr + 1'b1;
             tdat    <= current_quadlet[bit_sel];
@@ -478,12 +530,18 @@ module ESPMTX (
                 end
 
                 T_HEADER: begin
-                    if (bit_sel == 'd31) cfsm <= T_DATA;
+                    if (bit_sel == 'd31) begin
+                        cfsm        <= T_DATA;
+                        prime_active<= prime_valid;
+                    end
                 end
 
                 T_DATA: begin
                     if ((bit_sel == 'd31) & (tdata_sel == length_latched)) begin
                         cfsm    <= T_CRC;
+                        prime_active <= 1'b0;
+                    end else if (bit_sel == 'd31) begin
+                        prime_active <= 1'b0;
                     end
                 end
 
