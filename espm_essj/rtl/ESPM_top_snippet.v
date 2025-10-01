@@ -32,7 +32,9 @@ ESPMTX tx(
   .clock(tclk_dvrk), // internal 80MHz clock
   .tdata(tdata_dvrk), // data to send
   .page(16'b0),
-  .length(10'd64),    
+  .length(10'd64),
+  .crc_override_enable(1'b0),
+  .crc_override_value(16'h0000),
   .tdat(tdat_dvrk),
   .tdata_sel(tdata_sel_dvrk)
 );

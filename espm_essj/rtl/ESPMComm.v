@@ -18,6 +18,8 @@
 
 `timescale 1ns / 1ps
 
+/* verilator lint_off DECLFILENAME */
+
 `define ESPMCOMM_MAGIC 32'hAC450F28
 
 module ESPMRX (input wire clock,                 // bit clock for ESPM chain
@@ -54,7 +56,7 @@ module ESPMRX (input wire clock,                 // bit clock for ESPM chain
     R_CRC = 2'h3;
 
     initial begin
-        cfsm       <= FRAME;
+        cfsm = FRAME;
     end
 
     //----------------------------------------------------------------------------------------------
@@ -75,7 +77,7 @@ module ESPMRX (input wire clock,                 // bit clock for ESPM chain
             R_HEADER: begin
                 if (bit_sel == 'd31) begin
                     cfsm <= R_DATA;
-                    length <= rdata_shift[9:0] + (recovery_extra_delay_en ? recovery_extra_delay : 10'd0);
+                    length <= rdata_shift[9:0] + (recovery_extra_delay_en ? {4'd0, recovery_extra_delay} : 10'd0);
                     page <= rdata_shift[31:16];
                 end
             end
@@ -120,15 +122,234 @@ module ESPMRX (input wire clock,                 // bit clock for ESPM chain
 
 endmodule
 
+/* verilator lint_on DECLFILENAME */
+
+
+module ESSJBridge #(
+    parameter integer PAYLOAD_WORDS    = 64,
+    parameter integer ADC_WORD_COUNT   = 8,
+    parameter integer ADC_BASE_QUADLET = 56
+)(
+    input  wire        clock,
+    input  wire        reset,
+
+    // ESPMRX interface
+    input  wire [31:0] rx_data,
+    input  wire        rx_load,
+    input  wire [9:0]  rx_index,
+    input  wire        rx_crc_good,
+    input  wire        rx_eof,
+    input  wire [15:0] rx_page,
+    input  wire [9:0]  rx_length,
+
+    // ADC domain interface
+    input  wire        adc_clk,
+    input  wire        adc_valid,
+    input  wire [2:0]  adc_channel,
+    input  wire [31:0] adc_value,
+
+    // Serial output towards FPGA1394
+    output wire        tdat,
+    output wire [1:0]  tx_cfsm,
+    output wire        pkt_start,
+    output wire [9:0]  tdata_sel,
+    output wire        load_tdata
+`ifdef VERILATOR
+    , input  wire       debug_force_bad_crc
+    , output wire       debug_crc_override_request
+    , output wire [15:0] debug_crc_override_value
+`endif
+    );
+
+    localparam [9:0] PAYLOAD_WORDS_10B = PAYLOAD_WORDS[9:0];
+
+    // Ping-pong payload storage
+    reg [31:0] payload_mem [0:1][0:PAYLOAD_WORDS-1];
+    reg [15:0] page_mem [0:1];
+    reg [9:0]  length_mem [0:1];
+    reg        active_bank;
+    reg        write_bank;
+
+    // ADC synchronization registers
+    reg [31:0] adc_shadow [0:ADC_WORD_COUNT-1];
+    reg [31:0] adc_values [0:ADC_WORD_COUNT-1];
+    reg [ADC_WORD_COUNT-1:0] adc_req_toggle;
+    reg [ADC_WORD_COUNT-1:0] adc_ack_toggle;
+    reg [ADC_WORD_COUNT-1:0] adc_ack_sync1;
+    reg [ADC_WORD_COUNT-1:0] adc_ack_sync2;
+    reg [ADC_WORD_COUNT-1:0] adc_req_sync1;
+    reg [ADC_WORD_COUNT-1:0] adc_req_sync2;
+
+    // CRC management
+    reg force_bad_crc;
+    reg crc_override_request;
+
+    integer idx;
+    integer adc_slot;
+
+    wire debug_force_bad_crc_active;
+`ifdef VERILATOR
+    assign debug_force_bad_crc_active = debug_force_bad_crc;
+`else
+    assign debug_force_bad_crc_active = 1'b0;
+`endif
+
+    // ---------------------------------------------------------------------
+    // ADC clock domain logic
+    // ---------------------------------------------------------------------
+    always @(posedge adc_clk or posedge reset) begin
+        if (reset) begin
+            for (idx = 0; idx < ADC_WORD_COUNT; idx = idx + 1) begin
+                adc_shadow[idx]    <= 32'd0;
+                adc_req_toggle[idx]<= 1'b0;
+            end
+            adc_ack_sync1 <= {ADC_WORD_COUNT{1'b0}};
+            adc_ack_sync2 <= {ADC_WORD_COUNT{1'b0}};
+        end else begin
+            adc_ack_sync1 <= adc_ack_toggle;
+            adc_ack_sync2 <= adc_ack_sync1;
+
+            if (adc_valid && {{29{1'b0}}, adc_channel} < ADC_WORD_COUNT) begin
+                if (adc_ack_sync2[adc_channel] == adc_req_toggle[adc_channel]) begin
+                    adc_shadow[adc_channel]     <= adc_value;
+                    adc_req_toggle[adc_channel] <= ~adc_req_toggle[adc_channel];
+                end
+            end
+        end
+    end
+
+    // ---------------------------------------------------------------------
+    // ESSJ clock domain logic
+    // ---------------------------------------------------------------------
+    reg [9:0] sanitized_length_temp;
+
+    always @(posedge clock or posedge reset) begin
+        if (reset) begin
+            active_bank          <= 1'b0;
+            write_bank           <= 1'b1;
+            force_bad_crc        <= 1'b0;
+            crc_override_request <= 1'b0;
+            adc_req_sync1        <= {ADC_WORD_COUNT{1'b0}};
+            adc_req_sync2        <= {ADC_WORD_COUNT{1'b0}};
+            adc_ack_toggle       <= {ADC_WORD_COUNT{1'b0}};
+            for (idx = 0; idx < ADC_WORD_COUNT; idx = idx + 1) begin
+                adc_values[idx] <= 32'd0;
+            end
+            for (idx = 0; idx < PAYLOAD_WORDS; idx = idx + 1) begin
+                payload_mem[0][idx] <= 32'd0;
+                payload_mem[1][idx] <= 32'd0;
+            end
+            page_mem[0]   <= 16'd0;
+            page_mem[1]   <= 16'd0;
+            length_mem[0] <= PAYLOAD_WORDS_10B;
+            length_mem[1] <= PAYLOAD_WORDS_10B;
+        end else begin
+            adc_req_sync1 <= adc_req_toggle;
+            adc_req_sync2 <= adc_req_sync1;
+
+            for (idx = 0; idx < ADC_WORD_COUNT; idx = idx + 1) begin
+                if (adc_req_sync2[idx] != adc_ack_toggle[idx]) begin
+                    adc_values[idx]   <= adc_shadow[idx];
+                    adc_ack_toggle[idx]<= adc_req_sync2[idx];
+                end
+            end
+
+            if (rx_load && rx_index < PAYLOAD_WORDS_10B) begin
+                payload_mem[write_bank][rx_index[5:0]] <= rx_data;
+            end
+
+            if (rx_eof) begin
+                if (rx_crc_good) begin
+                    /* verilator lint_off BLKSEQ */
+                    sanitized_length_temp = (rx_length > PAYLOAD_WORDS_10B) ? PAYLOAD_WORDS_10B : rx_length;
+                    if (sanitized_length_temp == 10'd0) begin
+                        sanitized_length_temp = PAYLOAD_WORDS_10B;
+                    end
+                    /* verilator lint_on BLKSEQ */
+
+                    page_mem[write_bank]   <= rx_page;
+                    length_mem[write_bank] <= sanitized_length_temp;
+
+                    for (idx = 0; idx < ADC_WORD_COUNT; idx = idx + 1) begin
+                        /* verilator lint_off BLKSEQ */
+                        adc_slot = ADC_BASE_QUADLET + idx;
+                        /* verilator lint_on BLKSEQ */
+                        if (adc_slot < PAYLOAD_WORDS &&
+                            adc_slot < {{22{1'b0}}, sanitized_length_temp}) begin
+                            payload_mem[write_bank][adc_slot] <= adc_values[idx];
+                        end
+                    end
+
+                    active_bank   <= write_bank;
+                    write_bank    <= ~write_bank;
+                    force_bad_crc <= 1'b0;
+                end else begin
+                    force_bad_crc <= 1'b1;
+                end
+            end
+
+            if (debug_force_bad_crc_active) begin
+                force_bad_crc <= 1'b1;
+            end
+
+            if (pkt_start) begin
+                crc_override_request <= force_bad_crc | debug_force_bad_crc_active;
+                if (force_bad_crc | debug_force_bad_crc_active) begin
+                    force_bad_crc <= 1'b0;
+                end
+            end else begin
+                crc_override_request <= 1'b0;
+            end
+        end
+    end
+
+    // ------------------------------------------------------------------
+    // Transmit data selection
+    // ------------------------------------------------------------------
+    reg [31:0] tx_data_mux;
+    wire [9:0] tx_length_active;
+    assign tx_length_active = (length_mem[active_bank] == 10'd0) ? PAYLOAD_WORDS_10B : length_mem[active_bank];
+
+    always @(*) begin
+        if (tdata_sel < PAYLOAD_WORDS_10B) begin
+            tx_data_mux = payload_mem[active_bank][tdata_sel[5:0]];
+        end else begin
+            tx_data_mux = 32'd0;
+        end
+    end
+
+    ESPMTX tx (
+        .clock              (clock),
+        .tdata              (tx_data_mux),
+        .page               (page_mem[active_bank]),
+        .length             (tx_length_active),
+        .crc_override_enable(crc_override_request),
+        .crc_override_value (16'hDEAD),
+        .cfsm               (tx_cfsm),
+        .tdata_sel          (tdata_sel),
+        .pkt_start          (pkt_start),
+        .load_tdata         (load_tdata),
+        .tdat               (tdat)
+    );
+
+`ifdef VERILATOR
+    assign debug_crc_override_request = crc_override_request;
+    assign debug_crc_override_value   = 16'hDEAD;
+`endif
+
+endmodule
+
 
 module ESPMTX (
     input  wire        clock,      // received clock from ESM
     input  wire [31:0] tdata,      // parallel transmit data (output of mux selected by tdata_sel)
-    input [15:0] page,
-    input [9:0] length,
+    input  [15:0]      page,
+    input  [9:0]       length,
+    input  wire        crc_override_enable,
+    input  wire [15:0] crc_override_value,
 
     output reg   [1:0] cfsm,       // current state
-    output wire   [9:0] tdata_sel,  // 6 bit counter that selects tdata multiplexor
+    output wire  [9:0] tdata_sel,  // 6 bit counter that selects tdata multiplexor
     output reg         pkt_start,  // starting to xmit a new packet
     output reg         load_tdata, // loading serializer from parallel input
     output reg         tdat);      // serial data out
@@ -147,6 +368,8 @@ module ESPMTX (
     reg [9:0] length_latched;
     reg [31:0] current_quadlet;
     reg [31:0] payload_buffer;
+    reg        crc_override_active;
+    reg [15:0] crc_override_latched;
 
     localparam FRAME = 2'h0,  // transmit framing sequence
     T_HEADER = 2'h1,  // transmit header
@@ -155,9 +378,11 @@ module ESPMTX (
 
     initial
     begin
-        pkt_start  <= 'b0;
-        load_tdata <= 'd0;
-        cfsm       <= FRAME;  // start by framing on the recv data
+        pkt_start           = 'b0;
+        load_tdata          = 'd0;
+        cfsm                = FRAME;  // start by framing on the recv data
+        crc_override_active = 1'b0;
+        crc_override_latched= 16'd0;
     end
 
     //----------------------------------------------------------------------------------------------
@@ -167,7 +392,7 @@ module ESPMTX (
             FRAME: current_quadlet = `ESPMCOMM_MAGIC;
             T_HEADER: current_quadlet = {page_latched, 6'b0, length_latched};
             T_DATA: current_quadlet = payload_buffer;
-            T_CRC: current_quadlet = {16'b0, crc_data};
+            T_CRC: current_quadlet = {16'b0, crc_override_active ? crc_override_latched : crc_data};
             default: current_quadlet = 32'hcccccccc;
         endcase
     end
@@ -185,6 +410,15 @@ module ESPMTX (
         end
         pkt_start <= bit_ctr == 'd0;
         load_tdata <= bit_sel == 'd30; // assert at 30 to load at 31 because of pipelining
+
+        if (bit_ctr == 'd0) begin
+            if (crc_override_enable) begin
+                crc_override_active  <= 1'b1;
+                crc_override_latched <= crc_override_value;
+            end else begin
+                crc_override_active  <= 1'b0;
+            end
+        end
 
         case (cfsm)
             FRAME: begin
@@ -205,6 +439,7 @@ module ESPMTX (
                 if (bit_sel == 'd31) begin
                     cfsm    <= FRAME;
                     bit_ctr <= 'd0;
+                    crc_override_active <= 1'b0;
                 end
             end
         endcase

@@ -41,7 +41,8 @@ The clock line is driven by the originating board (ESPM or FPGA1394). ESSJ shoul
 Codex will run commands in a sandbox. Keep setup light-weight and deterministic.
 
 - Install HDL toolchain (sim only):
-TBD
+  - Ubuntu: `./scripts/setup_verilator_ubuntu.sh`
+  - macOS (ARM): `./scripts/setup_verilator_macos_arm.sh`
 
 ### Commands Codex should run
-- TBD
+- `./scripts/run_simulations.sh`
