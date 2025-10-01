@@ -163,13 +163,6 @@ module ESSJBridge #(
 
     localparam [9:0] PAYLOAD_WORDS_10B = PAYLOAD_WORDS[9:0];
 
-    // Ping-pong payload storage
-    reg [31:0] payload_mem [0:1][0:PAYLOAD_WORDS-1];
-    reg [15:0] page_mem [0:1];
-    reg [9:0]  length_mem [0:1];
-    reg        active_bank;
-    reg        write_bank;
-
     // ADC synchronization registers
     reg [31:0] adc_shadow [0:ADC_WORD_COUNT-1];
     reg [31:0] adc_values [0:ADC_WORD_COUNT-1];
@@ -180,12 +173,7 @@ module ESSJBridge #(
     reg [ADC_WORD_COUNT-1:0] adc_req_sync1;
     reg [ADC_WORD_COUNT-1:0] adc_req_sync2;
 
-    // CRC management
-    reg force_bad_crc;
-    reg crc_override_request;
-
     integer idx;
-    integer adc_slot;
 
     wire debug_force_bad_crc_active;
 `ifdef VERILATOR
@@ -219,112 +207,159 @@ module ESSJBridge #(
     end
 
     // ---------------------------------------------------------------------
-    // ESSJ clock domain logic
+    // ESSJ clock domain logic (streaming payload forwarding)
     // ---------------------------------------------------------------------
-    reg [9:0] sanitized_length_temp;
+    localparam [1:0] TX_STATE_DATA = 2'h2;
+    localparam [1:0] TX_STATE_CRC  = 2'h3;
+
+    reg [31:0] payload_fifo [0:PAYLOAD_WORDS-1];
+    reg [5:0]  fifo_wr_ptr;
+    reg [5:0]  fifo_rd_ptr;
+    reg [6:0]  fifo_count;
+
+    reg [9:0]  current_length;
+    reg [15:0] current_page;
+    reg [9:0]  tx_length_reg;
+    reg [15:0] tx_page_reg;
+    reg        frame_ready;
+    reg        hold_frame;
+    reg        override_pending;
+
+    function [9:0] sanitize_length;
+        input [9:0] raw_length;
+        begin
+            if (raw_length == 10'd0) begin
+                sanitize_length = PAYLOAD_WORDS_10B;
+            end else if (raw_length > PAYLOAD_WORDS_10B) begin
+                sanitize_length = PAYLOAD_WORDS_10B;
+            end else begin
+                sanitize_length = raw_length;
+            end
+        end
+    endfunction
 
     always @(posedge clock or posedge reset) begin
         if (reset) begin
-            active_bank          <= 1'b0;
-            write_bank           <= 1'b1;
-            force_bad_crc        <= 1'b0;
-            crc_override_request <= 1'b0;
-            adc_req_sync1        <= {ADC_WORD_COUNT{1'b0}};
-            adc_req_sync2        <= {ADC_WORD_COUNT{1'b0}};
-            adc_ack_toggle       <= {ADC_WORD_COUNT{1'b0}};
+            adc_req_sync1  <= {ADC_WORD_COUNT{1'b0}};
+            adc_req_sync2  <= {ADC_WORD_COUNT{1'b0}};
+            adc_ack_toggle <= {ADC_WORD_COUNT{1'b0}};
             for (idx = 0; idx < ADC_WORD_COUNT; idx = idx + 1) begin
                 adc_values[idx] <= 32'd0;
             end
-            for (idx = 0; idx < PAYLOAD_WORDS; idx = idx + 1) begin
-                payload_mem[0][idx] <= 32'd0;
-                payload_mem[1][idx] <= 32'd0;
-            end
-            page_mem[0]   <= 16'd0;
-            page_mem[1]   <= 16'd0;
-            length_mem[0] <= PAYLOAD_WORDS_10B;
-            length_mem[1] <= PAYLOAD_WORDS_10B;
         end else begin
             adc_req_sync1 <= adc_req_toggle;
             adc_req_sync2 <= adc_req_sync1;
 
             for (idx = 0; idx < ADC_WORD_COUNT; idx = idx + 1) begin
                 if (adc_req_sync2[idx] != adc_ack_toggle[idx]) begin
-                    adc_values[idx]   <= adc_shadow[idx];
-                    adc_ack_toggle[idx]<= adc_req_sync2[idx];
+                    adc_values[idx]    <= adc_shadow[idx];
+                    adc_ack_toggle[idx] <= adc_req_sync2[idx];
                 end
-            end
-
-            if (rx_load && rx_index < PAYLOAD_WORDS_10B) begin
-                payload_mem[write_bank][rx_index[5:0]] <= rx_data;
-            end
-
-            if (rx_eof) begin
-                if (rx_crc_good) begin
-                    /* verilator lint_off BLKSEQ */
-                    sanitized_length_temp = (rx_length > PAYLOAD_WORDS_10B) ? PAYLOAD_WORDS_10B : rx_length;
-                    if (sanitized_length_temp == 10'd0) begin
-                        sanitized_length_temp = PAYLOAD_WORDS_10B;
-                    end
-                    /* verilator lint_on BLKSEQ */
-
-                    page_mem[write_bank]   <= rx_page;
-                    length_mem[write_bank] <= sanitized_length_temp;
-
-                    for (idx = 0; idx < ADC_WORD_COUNT; idx = idx + 1) begin
-                        /* verilator lint_off BLKSEQ */
-                        adc_slot = ADC_BASE_QUADLET + idx;
-                        /* verilator lint_on BLKSEQ */
-                        if (adc_slot < PAYLOAD_WORDS &&
-                            adc_slot < {{22{1'b0}}, sanitized_length_temp}) begin
-                            payload_mem[write_bank][adc_slot] <= adc_values[idx];
-                        end
-                    end
-
-                    active_bank   <= write_bank;
-                    write_bank    <= ~write_bank;
-                    force_bad_crc <= 1'b0;
-                end else begin
-                    force_bad_crc <= 1'b1;
-                end
-            end
-
-            if (debug_force_bad_crc_active) begin
-                force_bad_crc <= 1'b1;
-            end
-
-            if (pkt_start) begin
-                crc_override_request <= force_bad_crc | debug_force_bad_crc_active;
-                if (force_bad_crc | debug_force_bad_crc_active) begin
-                    force_bad_crc <= 1'b0;
-                end
-            end else begin
-                crc_override_request <= 1'b0;
             end
         end
     end
 
-    // ------------------------------------------------------------------
-    // Transmit data selection
-    // ------------------------------------------------------------------
-    reg [31:0] tx_data_mux;
-    wire [9:0] tx_length_active;
-    assign tx_length_active = (length_mem[active_bank] == 10'd0) ? PAYLOAD_WORDS_10B : length_mem[active_bank];
+    wire frame_start_detect = rx_load && (rx_index == 10'd0);
+    wire [9:0] sanitized_length_next = sanitize_length(rx_length);
 
+    wire [9:0] active_length_for_write = (frame_ready || !hold_frame) ? current_length : sanitized_length_next;
+
+    wire [9:0] rx_index_ext = rx_index;
+    wire in_adc_window = (rx_index_ext >= ADC_BASE_QUADLET[9:0]) &&
+                         (rx_index_ext < (ADC_BASE_QUADLET + ADC_WORD_COUNT)[9:0]);
+    wire [9:0] adc_offset = rx_index_ext - ADC_BASE_QUADLET[9:0];
+    wire [2:0] adc_lookup_index = adc_offset[2:0];
+
+    reg [31:0] fifo_write_data;
     always @(*) begin
-        if (tdata_sel < PAYLOAD_WORDS_10B) begin
-            tx_data_mux = payload_mem[active_bank][tdata_sel[5:0]];
+        if (in_adc_window) begin
+            fifo_write_data = adc_values[adc_lookup_index];
         end else begin
-            tx_data_mux = 32'd0;
+            fifo_write_data = rx_data;
         end
     end
+
+    wire fifo_write_candidate = rx_load && (rx_index_ext < PAYLOAD_WORDS_10B);
+    wire fifo_write_enable = fifo_write_candidate &&
+                             (rx_index_ext < active_length_for_write) &&
+                             (fifo_count < PAYLOAD_WORDS);
+
+    wire fifo_empty = fifo_count == 7'd0;
+    wire fifo_read_enable = (tx_cfsm == TX_STATE_DATA) && load_tdata && !fifo_empty;
+
+    always @(posedge clock or posedge reset) begin
+        if (reset) begin
+            fifo_wr_ptr      <= 6'd0;
+            fifo_rd_ptr      <= 6'd0;
+            fifo_count       <= 7'd0;
+            current_length   <= PAYLOAD_WORDS_10B;
+            current_page     <= 16'd0;
+            tx_length_reg    <= PAYLOAD_WORDS_10B;
+            tx_page_reg      <= 16'd0;
+            frame_ready      <= 1'b0;
+            hold_frame       <= 1'b1;
+        end else begin
+            if (frame_start_detect) begin
+                current_length    <= sanitized_length_next;
+                current_page      <= rx_page;
+                frame_ready       <= 1'b1;
+            end
+
+            if (fifo_write_enable) begin
+                payload_fifo[fifo_wr_ptr] <= fifo_write_data;
+                fifo_wr_ptr <= fifo_wr_ptr + 6'd1;
+            end
+
+            if (fifo_read_enable) begin
+                fifo_rd_ptr <= fifo_rd_ptr + 6'd1;
+            end
+
+            case ({fifo_write_enable, fifo_read_enable})
+                2'b10: fifo_count <= fifo_count + 7'd1;
+                2'b01: fifo_count <= fifo_count - 7'd1;
+                default: fifo_count <= fifo_count;
+            endcase
+
+            if (hold_frame && frame_ready && !fifo_empty) begin
+                tx_length_reg <= current_length;
+                tx_page_reg   <= current_page;
+                hold_frame    <= 1'b0;
+                frame_ready   <= 1'b0;
+            end else if (frame_done) begin
+                hold_frame <= 1'b1;
+            end
+        end
+    end
+
+    always @(posedge clock or posedge reset) begin
+        if (reset) begin
+            override_pending <= 1'b0;
+        end else begin
+            if (rx_eof && !rx_crc_good) begin
+                override_pending <= 1'b1;
+            end
+            if (debug_force_bad_crc_active) begin
+                override_pending <= 1'b1;
+            end
+            if (frame_done) begin
+                override_pending <= 1'b0;
+            end
+        end
+    end
+
+    wire [31:0] tx_data_stream = payload_fifo[fifo_rd_ptr];
+    wire [9:0] tx_length_active = (tx_length_reg == 10'd0) ? PAYLOAD_WORDS_10B : tx_length_reg;
+    wire        frame_done;
 
     ESPMTX tx (
         .clock              (clock),
-        .tdata              (tx_data_mux),
-        .page               (page_mem[active_bank]),
+        .tdata              (tx_data_stream),
+        .page               (tx_page_reg),
         .length             (tx_length_active),
-        .crc_override_enable(crc_override_request),
+        .crc_override_enable(override_pending),
         .crc_override_value (16'hDEAD),
+        .hold_frame         (hold_frame),
+        .frame_done         (frame_done),
         .cfsm               (tx_cfsm),
         .tdata_sel          (tdata_sel),
         .pkt_start          (pkt_start),
@@ -333,7 +368,7 @@ module ESSJBridge #(
     );
 
 `ifdef VERILATOR
-    assign debug_crc_override_request = crc_override_request;
+    assign debug_crc_override_request = override_pending && (tx_cfsm == TX_STATE_CRC);
     assign debug_crc_override_value   = 16'hDEAD;
 `endif
 
@@ -347,12 +382,15 @@ module ESPMTX (
     input  [9:0]       length,
     input  wire        crc_override_enable,
     input  wire [15:0] crc_override_value,
+    input  wire        hold_frame,
 
     output reg   [1:0] cfsm,       // current state
     output wire  [9:0] tdata_sel,  // 6 bit counter that selects tdata multiplexor
     output reg         pkt_start,  // starting to xmit a new packet
     output reg         load_tdata, // loading serializer from parallel input
-    output reg         tdat);      // serial data out
+    output reg         tdat,       // serial data out
+    output reg         frame_done  // pulses high for one cycle at end of CRC
+    );
 
     // internal variables
     wire  [15:0]  crc_data;
@@ -370,6 +408,9 @@ module ESPMTX (
     reg [31:0] payload_buffer;
     reg        crc_override_active;
     reg [15:0] crc_override_latched;
+    wire       hold_active;
+
+    assign hold_active = hold_frame && (cfsm == FRAME) && (bit_ctr == 15'd0);
 
     localparam FRAME = 2'h0,  // transmit framing sequence
     T_HEADER = 2'h1,  // transmit header
@@ -383,6 +424,7 @@ module ESPMTX (
         cfsm                = FRAME;  // start by framing on the recv data
         crc_override_active = 1'b0;
         crc_override_latched= 16'd0;
+        frame_done          = 1'b0;
     end
 
     //----------------------------------------------------------------------------------------------
@@ -398,51 +440,61 @@ module ESPMTX (
     end
 
     always @(posedge clock) begin
-        bit_ctr <= bit_ctr + 1'b1;
-        tdat <= current_quadlet[bit_sel];
+        if (hold_active) begin
+            bit_ctr    <= 15'd0;
+            pkt_start  <= 1'b0;
+            load_tdata <= 1'b0;
+            tdat       <= 1'b0;
+            frame_done <= 1'b0;
+        end else begin
+            bit_ctr <= bit_ctr + 1'b1;
+            tdat    <= current_quadlet[bit_sel];
 
-        if (bit_ctr == 'd31) begin
-            page_latched <= page;
-            length_latched <= length;
-        end
-        if (load_tdata) begin
-            payload_buffer <= tdata;
-        end
-        pkt_start <= bit_ctr == 'd0;
-        load_tdata <= bit_sel == 'd30; // assert at 30 to load at 31 because of pipelining
-
-        if (bit_ctr == 'd0) begin
-            if (crc_override_enable) begin
-                crc_override_active  <= 1'b1;
-                crc_override_latched <= crc_override_value;
-            end else begin
-                crc_override_active  <= 1'b0;
+            if (bit_ctr == 'd31) begin
+                page_latched   <= page;
+                length_latched <= length;
             end
-        end
-
-        case (cfsm)
-            FRAME: begin
-                if (bit_sel == 'd31) cfsm <= T_HEADER;
+            if (load_tdata) begin
+                payload_buffer <= tdata;
             end
+            pkt_start  <= bit_ctr == 'd0;
+            load_tdata <= bit_sel == 'd30; // assert at 30 to load at 31 because of pipelining
+            frame_done <= (cfsm == T_CRC) && (bit_sel == 'd31);
 
-            T_HEADER: begin
-                if (bit_sel == 'd31) cfsm <= T_DATA;
-            end
-
-            T_DATA: begin
-                if ((bit_sel == 'd31) & (tdata_sel == length_latched)) begin
-                    cfsm    <= T_CRC;
-                end
-            end
-
-            T_CRC: begin
-                if (bit_sel == 'd31) begin
-                    cfsm    <= FRAME;
-                    bit_ctr <= 'd0;
+            if ((cfsm == T_DATA) && (bit_sel == 'd31) && (tdata_sel == length_latched)) begin
+                if (crc_override_enable) begin
+                    crc_override_active  <= 1'b1;
+                    crc_override_latched <= crc_override_value;
+                end else begin
                     crc_override_active <= 1'b0;
                 end
+            end else if ((cfsm == T_CRC) && (bit_sel == 'd31)) begin
+                crc_override_active <= 1'b0;
             end
-        endcase
+
+            case (cfsm)
+                FRAME: begin
+                    if (bit_sel == 'd31) cfsm <= T_HEADER;
+                end
+
+                T_HEADER: begin
+                    if (bit_sel == 'd31) cfsm <= T_DATA;
+                end
+
+                T_DATA: begin
+                    if ((bit_sel == 'd31) & (tdata_sel == length_latched)) begin
+                        cfsm    <= T_CRC;
+                    end
+                end
+
+                T_CRC: begin
+                    if (bit_sel == 'd31) begin
+                        cfsm    <= FRAME;
+                        bit_ctr <= 'd0;
+                    end
+                end
+            endcase
+        end
     end
 
     reg crc_en = 'b0;

@@ -47,11 +47,13 @@ module tb_espm_to_fpga_through_essj;
         .length             (10'd64),
         .crc_override_enable(1'b0),
         .crc_override_value (16'h0000),
+        .hold_frame         (1'b0),
         .cfsm               (tx_cfsm_unused),
         .tdata_sel          (tsel),
         .pkt_start          (tx_pkt_start_unused),
         .load_tdata         (tx_load_tdata_unused),
-        .tdat               (serial_source)
+        .tdat               (serial_source),
+        .frame_done         ()
     );
 
     reg adc_clk = 1'b0;

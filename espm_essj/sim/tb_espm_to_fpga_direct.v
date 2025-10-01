@@ -44,11 +44,13 @@ module tb_espm_to_fpga_direct;
         .length             (10'd64),
         .crc_override_enable(1'b0),
         .crc_override_value (16'h0000),
+        .hold_frame         (1'b0),
         .cfsm               (tx_cfsm_unused),
         .tdata_sel          (tsel),
         .pkt_start          (pkt_start),
         .load_tdata         (load_tdata),
-        .tdat               (serial_out)
+        .tdat               (serial_out),
+        .frame_done         ()
     );
 
     wire [31:0] rdata;
