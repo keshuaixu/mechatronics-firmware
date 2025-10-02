@@ -456,13 +456,17 @@ always @(posedge sysclk) begin
 end
 
 ESPMTX espm_tx (
-    .clock(lvds_tx_clk),
-    .tdata(espm_tx_tdata),
-    .page(16'b0),
-    .length(10'd64),
-    .tdata_sel(espm_tx_tdata_sel),
-    .pkt_start(espm_tx_pkt_start),
-    .tdat(LVDS_TDAT)
+    .clock              (lvds_tx_clk),
+    .tdata              (espm_tx_tdata),
+    .page               (16'b0),
+    .length             (10'd64),
+    .crc_override_enable(1'b0),
+    .crc_override_value (16'h0000),
+    .hold_frame         (1'b0),
+    .tdata_sel          (espm_tx_tdata_sel),
+    .pkt_start          (espm_tx_pkt_start),
+    .tdat               (LVDS_TDAT),
+    .frame_done         ()
 );
 
 reg [31:0] espm_tx_ram [0:63];

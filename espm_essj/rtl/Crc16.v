@@ -1,3 +1,7 @@
+`timescale 1ns / 1ps
+
+/* verilator lint_off DECLFILENAME */
+
 // Lightly modified from original to replace reset with initialize
 
 //-----------------------------------------------------------------------------
@@ -46,3 +50,5 @@ module crc16(
         end // always
     end
   endmodule // crc
+
+/* verilator lint_on DECLFILENAME */
