@@ -22,9 +22,9 @@ Implement Board **ESSJ** communication so existing FPGA1394↔ESPM traffic runs 
 - No changes to shipped FPGA1394 or ESPM RTL are required.
 
 ## Repo map
-- `FPGA1394_QLA/Verilog` — FPGA1394‑side complete code. The communication protocol is defined in `ESPMComm.v`.
-- `espm_essj/rtl` —  **Create/modify here.** ESPM‑side interface snippet we can share publicly. 
+- `espm_essj/rtl` —  **Create/modify here.** Public RTL snippets covering the ESPM/ESSJ/FPGA1394 link.
   - Target: `ESSJ_top.v` for top level on ESSJ.
+  - Target: `DRAC_top.v` as a minimal FPGA1394/DRAC example that instantiates the link blocks.
   - Target: `ESPM_top.v` for top level on ESPM, for test purpose.
   - Target: `ESPMComm.v` add an `ESSJBridge` module for ESPM–>FPGA1394 link.
   - Target: `test_constants.v` to provide test definitions for undefined constants so that testbenches can run.
